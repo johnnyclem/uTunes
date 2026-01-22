@@ -316,7 +316,24 @@ parse_metadata() {
     track_number=""
     compilation="false"
 
-    eval "$(echo "$metadata" | sed 's/|/ /g' | sed 's/=\(.*\)/="\1"/g')"
+    # Parse metadata - split by null character and process each key=value pair
+    while IFS= read -r -d '' line; do
+        if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            # Handle special cases
+            case "$key" in
+                "artist") artist="$value" ;;
+                "album") album="$value" ;;
+                "album_artist") album_artist="$value" ;;
+                "title") title="$value" ;;
+                "year") year="$value" ;;
+                "genre") genre="$value" ;;
+                "track_number") track_number="$value" ;;
+                "compilation") compilation="$value" ;;
+            esac
+        fi
+    done <<< "$metadata"
 }
 
 classify_track() {
@@ -328,18 +345,55 @@ classify_track() {
 
     local classification="single"
     local folder_name="Singles"
-
-    if [[ "$compilation" == "true" ]] || [[ -n "$album" && "$album" != "Unknown Album" ]]; then
-        if [[ "$compilation" == "true" ]] || [[ -n "$album_artist" && "$album_artist" != "$artist" ]]; then
-            classification="compilation"
-            folder_name="Compilations"
-        else
+    
+    # Get directory-based artist/album context
+    local dir_context
+    dir_context=$(get_album_context "$filepath")
+    local dir_artist="${dir_context%%|*}"
+    local dir_album="${dir_context##*|}"
+    
+    # Prioritize directory analysis over metadata for album detection
+    local structure
+    structure=$(analyze_directory_structure "$filepath")
+    
+    case "$structure" in
+        "multi_album")
             classification="album"
-            folder_name="$album"
-        fi
-    fi
+            folder_name="$dir_album"
+            # Use directory-derived artist but prefer metadata if available
+            if [[ "$artist" != "Unknown Artist" ]]; then
+                # Keep metadata artist
+                :
+            else
+                artist="$dir_artist"
+            fi
+            ;;
+        "single_album")
+            classification="album"
+            folder_name="$dir_album"
+            # Use directory-derived artist but prefer metadata if available
+            if [[ "$artist" != "Unknown Artist" ]]; then
+                # Keep metadata artist
+                :
+            else
+                artist="$dir_artist"
+            fi
+            ;;
+        *)
+            # Fallback to metadata-based classification for unknown structures
+            if [[ "$compilation" == "true" ]] || [[ -n "$album" && "$album" != "Unknown Album" ]]; then
+                if [[ "$compilation" == "true" ]] || [[ -n "$album_artist" && "$album_artist" != "$artist" ]]; then
+                    classification="compilation"
+                    folder_name="Compilations"
+                else
+                    classification="album"
+                    folder_name="$album"
+                fi
+            fi
+            ;;
+    esac
 
-    echo "$classification|$folder_name"
+    echo "$classification|$folder_name|$artist"
 }
 
 sanitize_filename() {
@@ -360,6 +414,93 @@ sanitize_filename() {
     fi
 
     echo "$filename"
+}
+
+has_audio_files() {
+    local dir="$1"
+    local ext
+    for ext in $AUDIO_EXTENSIONS; do
+        if find "$dir" -maxdepth 1 -type f -iname "$ext" -quit 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+has_audio_subdirectories() {
+    local dir="$1"
+    local subdir
+    while IFS= read -r -d '' subdir; do
+        if has_audio_files "$subdir"; then
+            return 0
+        fi
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    return 1
+}
+
+analyze_directory_structure() {
+    local filepath="$1"
+    local dir
+    dir=$(dirname "$filepath")
+    local parent_dir
+    parent_dir=$(dirname "$dir")
+    
+    # Check if parent directory has subdirectories with audio files AND we're at least 2 levels deep from source
+    if [[ "$parent_dir" != "$SOURCE_DIR" ]] && has_audio_subdirectories "$parent_dir"; then
+        echo "multi_album"
+    # Check if current directory has audio files but no subdirectories with audio (single album structure)
+    elif has_audio_files "$dir"; then
+        echo "single_album"
+    else
+        echo "unknown"
+    fi
+}
+
+extract_artist_album_from_folder() {
+    local folder_path="$1"
+    local folder_name
+    folder_name=$(basename "$folder_path")
+    
+    local artist="Unknown Artist"
+    local album="$folder_name"
+    
+    if [[ "$folder_name" =~ ^(.+)[[:space:]]*-[[:space:]]*(.+)$ ]]; then
+        artist="${BASH_REMATCH[1]}"
+        album="${BASH_REMATCH[2]}"
+    else
+        artist="$folder_name"
+    fi
+    
+    echo "$artist|$album"
+}
+
+get_album_context() {
+    local filepath="$1"
+    local dir
+    dir=$(dirname "$filepath")
+    local structure
+    structure=$(analyze_directory_structure "$filepath")
+    
+    case "$structure" in
+        "multi_album")
+            local parent_dir artist album
+            parent_dir=$(dirname "$dir")
+            album_context=$(extract_artist_album_from_folder "$parent_dir")
+            artist="${album_context%%|*}"
+            album=$(basename "$dir")
+            ;;
+        "single_album")
+            album_context=$(extract_artist_album_from_folder "$dir")
+            artist="${album_context%%|*}"
+            album="${album_context##*|}"
+            ;;
+        *)
+            artist="Unknown Artist"
+            album="Unknown Album"
+            ;;
+    esac
+    
+    echo "$artist|$album"
 }
 
 get_track_number() {
@@ -614,42 +755,56 @@ show_preview() {
     local unique_artists=()
     local ext
 
+# Build array of files first to avoid subshell issues
+    local files_array=()
     for ext in $AUDIO_EXTENSIONS; do
         while IFS= read -r -d '' file; do
-            ((file_count++))
-
-            if is_lossless "$file"; then
-                ((lossless_count++))
-            else
-                ((lossy_count++))
-            fi
-
-            parse_metadata "$file"
-
-            local classification_result
-            classification_result=$(classify_track "$file" "$artist" "$album" "$album_artist" "$compilation")
-            local classification="${classification_result%%|*}"
-            local folder_name="${classification_result#*|}"
-
-            case "$classification" in
-                album) ((album_count++)) ;;
-                single) ((single_count++)) ;;
-                compilation) ((compilation_count++)) ;;
-            esac
-
-            local found=0
-            if [[ ${#unique_artists[@]} -gt 0 ]]; then
-                for ua in "${unique_artists[@]}"; do
-                    if [[ "$ua" == "$artist" ]]; then
-                        found=1
-                        break
-                    fi
-                done
-            fi
-            if [[ $found -eq 0 ]]; then
-                unique_artists+=("$artist")
-            fi
+            files_array+=("$file")
         done < <(find "$SOURCE_DIR" -type f -iname "$ext" -print0 2>/dev/null)
+    done
+    
+    # Process files
+    for file in "${files_array[@]}"; do
+        ((file_count++))
+
+        if is_lossless "$file"; then
+            ((lossless_count++))
+        else
+            ((lossy_count++))
+        fi
+
+        parse_metadata "$file"
+
+        local classification_result
+        classification_result=$(classify_track "$file" "$artist" "$album" "$album_artist" "$compilation")
+        local classification="${classification_result%%|*}"
+        classification_result="${classification_result#*|}"
+        local folder_name="${classification_result%%|*}"
+        local updated_artist="${classification_result##*|}"
+        
+        # Update artist if directory analysis provided a better one
+        if [[ -n "$updated_artist" && "$updated_artist" != "Unknown Artist" ]]; then
+            artist="$updated_artist"
+        fi
+
+        case "$classification" in
+            album) ((album_count++)) ;;
+            single) ((single_count++)) ;;
+            compilation) ((compilation_count++)) ;;
+        esac
+
+        found=0
+        if [[ ${#unique_artists[@]} -gt 0 ]]; then
+            for ua in "${unique_artists[@]}"; do
+                if [[ "$ua" == "$artist" ]]; then
+                    found=1
+                    break
+                fi
+            done
+        fi
+        if [[ $found -eq 0 ]]; then
+            unique_artists+=("$artist")
+        fi
     done
 
     local sizes
@@ -738,7 +893,14 @@ process_file() {
     local classification_result
     classification_result=$(classify_track "$filepath" "$artist" "$album" "$album_artist" "$compilation")
     local classification="${classification_result%%|*}"
-    local folder_name="${classification_result#*|}"
+    classification_result="${classification_result#*|}"
+    local folder_name="${classification_result%%|*}"
+    local updated_artist="${classification_result##*|}"
+    
+    # Update artist if directory analysis provided a better one
+    if [[ -n "$updated_artist" && "$updated_artist" != "Unknown Artist" ]]; then
+        artist="$updated_artist"
+    fi
 
     local target_rel
     target_rel=$(generate_target_path "$filepath" "$artist" "$album" "$title" "$track_number" "$classification" "$folder_name")
