@@ -563,7 +563,7 @@ needs_conversion() {
         return 1
     fi
 
-    if [[ "${ext,,}" == "mp3" ]]; then
+    if [[ "$(echo "$ext" | tr '[:upper:]' '[:lower:]')" == "mp3" ]]; then
         local bitrate
         bitrate=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "$filepath" 2>/dev/null | cut -d. -f1)
         bitrate=${bitrate:-0}
@@ -851,6 +851,11 @@ update_progress() {
     local current=$1
     local total=$2
     local current_file="$3"
+
+    # Avoid division by zero
+    if [[ $total -eq 0 ]]; then
+        return
+    fi
 
     local width=40
     local percent=$((current * 100 / total))
